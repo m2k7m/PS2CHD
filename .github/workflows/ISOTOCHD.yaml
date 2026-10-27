@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       filename:
-        description: Output filename (without .chd; no sensitive information)
+        description: Game name (with or without .iso/.chd; no sensitive information)
         required: true
         default: game
         type: string
@@ -17,6 +17,11 @@ on:
           - auto
           - dvd
           - cd
+      viking_folder:
+        description: Destination folder on VikingFile (supports Parent/Subfolder)
+        required: true
+        default: PS2
+        type: string
 
 permissions: {}
 
@@ -42,6 +47,7 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           OUTPUT_NAME: ${{ inputs.filename }}
           DISC_TYPE: ${{ inputs.disc_type }}
+          VIKING_FOLDER: ${{ inputs.viking_folder }}
         run: |
           python3 - <<'PY'
           import json
@@ -159,7 +165,26 @@ jobs:
                       or not re.fullmatch(r"[\w .()\[\]'&+,-]{1,160}", name)):
                   raise ConfigurationError(
                       "Invalid filename. Use 1-160 letters, digits, spaces, dots, parentheses, brackets, apostrophes, ampersands, plus signs, commas, underscores or hyphens, starting with a letter or digit. Paths are not allowed.")
-              return name if name.lower().endswith(".chd") else name + ".chd"
+              if name.lower().endswith(".chd"):
+                  return name
+              suffix = Path(name).suffix
+              if suffix.lower() in (".iso", ".bin", ".img", ".cue", ".mdf", ".nrg", ".cso"):
+                  name = name[:-len(suffix)]
+              return name + ".chd"
+
+          def remote_folder(value):
+              folder = value.strip() or "PS2"
+              parts = folder.split("/")
+              if (len(folder) > 255 or any(part.strip() in ("", ".", "..")
+                      or not re.fullmatch(r"[\w .()\[\]'&+,-]+", part) for part in parts)):
+                  raise ConfigurationError("Invalid VikingFile folder. Use folder names separated by /, without empty segments, backslashes or parent-directory references (maximum 255 characters).")
+              return folder
+
+          def notifications_configured():
+              # Partial or invalid notification settings must not expose results
+              # through a fallback in GitHub logs or the run summary.
+              return any(os.environ.get(key, "").strip() for key in
+                         ("DISCORD_WEBHOOK_URL", "TELEGRAM_BOT_TOKEN", "TELEGRAM_USER_ID"))
 
           def https_url(value, viking=False):
               parsed = urllib.parse.urlsplit(value)
@@ -270,7 +295,7 @@ jobs:
                           raise WorkflowError(f"Part upload failed after three attempts: {detail}.") from None
                       time.sleep(5 * (attempt + 1))
 
-          def upload(path, user, stats=None):
+          def upload(path, user, stats=None, folder="PS2"):
               size = path.stat().st_size
               if stats is not None:
                   stats.begin(size)
@@ -283,7 +308,7 @@ jobs:
               if len(urls) != count or plan.get("numberParts") != count:
                   raise ValueError("Upload plan does not match file size.")
               fields = {"key": plan["key"], "uploadId": plan["uploadId"],
-                        "name": path.name, "user": user}
+                        "name": path.name, "user": user, "path": folder}
               for index, url in enumerate(urls):
                   print(f"Uploading part {index + 1}/{count}", flush=True)
                   offset = index * part_size
@@ -337,6 +362,7 @@ jobs:
                   self.transfers = {stage: TransferStats() for stage in ("Downloading", "Uploading")}
                   self.disc = None
                   self.disc_reason = None
+                  self.folder = "PS2"
                   self.link = None
                   self.iso_size = None
                   self.size = None
@@ -360,7 +386,7 @@ jobs:
 
               def warning(self):
                   if not self.warned:
-                      print("::warning::Discord progress update failed. Check DISCORD_WEBHOOK_URL and webhook permissions. Results remain available in Actions.", flush=True)
+                      print("::warning::Discord progress update failed. Check DISCORD_WEBHOOK_URL and webhook permissions. Result details will not be published in GitHub.", flush=True)
                       self.warned = True
 
               def elapsed(self):
@@ -372,7 +398,7 @@ jobs:
               def payload(self):
                   now = time.monotonic()
                   fields = [{"name": "📀 Output", "value": f"`{self.name}`", "inline": False},
-                            {"name": "🔒 Source", "value": "Task for the configured ISO link (hidden)", "inline": False}]
+                            {"name": "VikingFile folder", "value": f"`{self.folder}`", "inline": False}]
                   if self.disc:
                       fields.append({"name": "Disc type", "value": f"{self.disc.upper()} · {self.disc_reason}", "inline": False})
                   for stage in self.STAGES:
@@ -398,7 +424,7 @@ jobs:
                       fields.append({"name": "🔗 Download", "value": f"[Download CHD from VikingFile]({self.link})", "inline": False})
                   if self.failure_reason:
                       fields.append({"name": "Failure reason", "value": self.failure_reason, "inline": False})
-                  description = {"Task started": "Task started for your configured ISO link.",
+                  description = {"Task started": "Your conversion task has started.",
                                  "Completed": "Your CHD is verified and ready to download.",
                                  "Failed": "Processing stopped. Check the Actions log for details."}.get(
                                      self.state, f"{self.state} your game. This message refreshes every 30 seconds.")
@@ -490,8 +516,11 @@ jobs:
               if progress.iso_size is not None:
                   message += (f"\nOriginal ISO: {human_size(progress.iso_size)}\nCHD: {human_size(size)}"
                               f"\nSpace savings: {savings(progress.iso_size, size)}")
-              delivered = progress.sent
-              fallback = bool(os.environ.get("DISCORD_WEBHOOK_URL", "").strip()) and not progress.sent
+              message += f"\nVikingFile folder: {progress.folder}"
+              if progress.disc:
+                  message += f"\nDisc type: {progress.disc.upper()} ({progress.disc_reason})"
+              message += (f"\nDownload speed: {progress.transfers['Downloading'].text()}"
+                          f"\nUpload speed: {progress.transfers['Uploading'].text()}")
               token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
               target = os.environ.get("TELEGRAM_USER_ID", "").strip()
               if token or target:
@@ -502,14 +531,12 @@ jobs:
                                                     {"chat_id": target, "text": message})
                       if not isinstance(result, dict) or result.get("ok") is not True:
                           raise ValueError("Telegram rejected the notification.")
-                      delivered = True
                       print("Telegram notification sent.", flush=True)
                   except Exception as error:
                       if isinstance(error, urllib.error.HTTPError):
                           error.close()
                       print("::warning::Telegram notification failed. Check both Telegram secrets and start the bot's private chat.", flush=True)
-                      fallback = True
-              if not delivered or fallback:
+              if not notifications_configured():
                   print(message, flush=True)
 
           def main():
@@ -525,14 +552,16 @@ jobs:
                   except Exception:
                       raise ConfigurationError("ISO_URL must be a valid HTTPS URL without embedded credentials or a fragment.") from None
                   name = output_filename(os.environ.get("OUTPUT_NAME", "game"))
+                  folder = remote_folder(os.environ.get("VIKING_FOLDER", "PS2"))
                   disc = os.environ.get("DISC_TYPE", "auto")
                   if disc not in ("auto", "dvd", "cd"):
                       raise ConfigurationError("Disc type must be auto, dvd or cd.")
                   progress.name = name
+                  progress.folder = folder
                   progress.begin()
-                  with tempfile.TemporaryDirectory(prefix="ps2chd-", dir=os.environ.get("RUNNER_TEMP")) as folder:
-                      iso = Path(folder) / "source.iso"
-                      chd = Path(folder) / name
+                  with tempfile.TemporaryDirectory(prefix="ps2chd-", dir=os.environ.get("RUNNER_TEMP")) as work_dir:
+                      iso = Path(work_dir) / "source.iso"
+                      chd = Path(work_dir) / name
                       stage = "Downloading ISO"
                       print(stage, flush=True)
                       with progress.phase("Downloading"):
@@ -559,15 +588,16 @@ jobs:
                       stage = "Uploading CHD"
                       print(stage, flush=True)
                       with progress.phase("Uploading"):
-                          link = upload(chd, user, stats=progress.transfers["Uploading"])
+                          link = upload(chd, user, stats=progress.transfers["Uploading"], folder=folder)
                       size = chd.stat().st_size
                       progress.finish(size=size, link=link)
-                      with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-                          summary.write(f"## Conversion complete\n\nFile: `{name}`\n\n[VikingFile download]({link})\n")
-                          summary.write(f"\n```text\n{progress.timing_lines()}\nTotal elapsed: {duration(progress.elapsed())}\n```\n")
-                          summary.write(f"\nDisc type: {disc.upper()} ({reason})\n\nDownload: {progress.transfers['Downloading'].text()}\n\nUpload: {progress.transfers['Uploading'].text()}\n")
-                          summary.write(f"\nOriginal ISO: {human_size(progress.iso_size)}\n\nCHD: {human_size(size)}\n\nSpace savings: {savings(progress.iso_size, size)}\n")
-                      print("Upload complete. Download link is in the run summary.", flush=True)
+                      if not notifications_configured():
+                          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                              summary.write(f"## Conversion complete\n\nFile: `{name}`\n\n[VikingFile download]({link})\n")
+                              summary.write(f"\n```text\n{progress.timing_lines()}\nTotal elapsed: {duration(progress.elapsed())}\n```\n")
+                              summary.write(f"\nDisc type: {disc.upper()} ({reason})\n\nDownload: {progress.transfers['Downloading'].text()}\n\nUpload: {progress.transfers['Uploading'].text()}\n")
+                              summary.write(f"\nOriginal ISO: {human_size(progress.iso_size)}\n\nCHD: {human_size(size)}\n\nSpace savings: {savings(progress.iso_size, size)}\n\nVikingFile folder: `{folder}`\n")
+                      print("Upload complete.", flush=True)
                       notify_result(name, size, link, progress)
               except Exception as error:
                   detail = (str(error) if isinstance(error, WorkflowError) else
