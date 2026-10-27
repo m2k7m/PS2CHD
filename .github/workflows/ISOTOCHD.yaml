@@ -63,6 +63,20 @@ jobs:
           MAX_ISO = 9 * 1024**3
           RESERVE = 1024**3
 
+          class WorkflowError(RuntimeError):
+              """A deliberately safe, user-facing error message."""
+
+          class ConfigurationError(WorkflowError):
+              pass
+
+          def output_filename(value):
+              name = value.strip()
+              if (not name or not name[0].isalnum()
+                      or not re.fullmatch(r"[\w .()\[\]'&+,-]{1,160}", name)):
+                  raise ConfigurationError(
+                      "Invalid filename. Use 1-160 letters, digits, spaces, dots, parentheses, brackets, apostrophes, ampersands, plus signs, commas, underscores or hyphens, starting with a letter or digit. Paths are not allowed.")
+              return name if name.lower().endswith(".chd") else name + ".chd"
+
           def https_url(value, viking=False):
               parsed = urllib.parse.urlsplit(value)
               host = (parsed.hostname or "").lower()
@@ -216,6 +230,7 @@ jobs:
                   self.timings = {}
                   self.link = None
                   self.size = None
+                  self.failure_reason = None
                   self.sent = False
                   self.warned = False
                   self.lock = threading.RLock()
@@ -262,6 +277,8 @@ jobs:
                       fields.append({"name": "📦 CHD size", "value": f"{self.size / 1024**2:,.2f} MiB", "inline": True})
                   if self.link:
                       fields.append({"name": "🔗 Download", "value": f"[Download CHD from VikingFile]({self.link})", "inline": False})
+                  if self.failure_reason:
+                      fields.append({"name": "Failure reason", "value": self.failure_reason, "inline": False})
                   description = {"Task started": "Task started for your configured ISO link.",
                                  "Completed": "Your CHD is verified and ready to download.",
                                  "Failed": "Processing stopped. Check the Actions log for details."}.get(
@@ -326,7 +343,7 @@ jobs:
                           self.timings[stage] = time.monotonic() - self.active_since
                           self.active = None
 
-              def finish(self, failed=False, size=None, link=None):
+              def finish(self, failed=False, size=None, link=None, reason=None):
                   self.stop.set()
                   if self.worker:
                       self.worker.join()
@@ -335,6 +352,7 @@ jobs:
                       self.state = "Failed" if failed else "Completed"
                       self.ended = time.monotonic()
                       self.size, self.link = size, link
+                      self.failure_reason = reason
                   self.publish()
                   return self.sent
 
@@ -362,21 +380,22 @@ jobs:
                   print(message, flush=True)
 
           def main():
-              url = os.environ.get("ISO_URL", "").strip()
-              user = os.environ.get("VIKINGFILE_USER_HASH", "").strip()
-              if not url or not user:
-                  raise ValueError("Add ISO_URL and VIKINGFILE_USER_HASH as Actions secrets.")
-              https_url(url)
-              name = os.environ.get("OUTPUT_NAME", "game")
-              if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", name):
-                  raise ValueError("Filename must be 1-100 ASCII letters, digits, dots, underscores or hyphens.")
-              disc = os.environ.get("DISC_TYPE", "dvd")
-              if disc not in ("dvd", "cd"):
-                  raise ValueError("Disc type must be dvd or cd.")
-              name = name if name.lower().endswith(".chd") else name + ".chd"
-              stage = "Preparing"
-              progress = DiscordProgress(name)
+              stage = "Validating configuration"
+              progress = DiscordProgress("Preparing task")
               try:
+                  url = os.environ.get("ISO_URL", "").strip()
+                  user = os.environ.get("VIKINGFILE_USER_HASH", "").strip()
+                  if not url or not user:
+                      raise ConfigurationError("Add ISO_URL and VIKINGFILE_USER_HASH as Actions secrets.")
+                  try:
+                      https_url(url)
+                  except Exception:
+                      raise ConfigurationError("ISO_URL must be a valid HTTPS URL without embedded credentials or a fragment.") from None
+                  name = output_filename(os.environ.get("OUTPUT_NAME", "game"))
+                  disc = os.environ.get("DISC_TYPE", "dvd")
+                  if disc not in ("dvd", "cd"):
+                      raise ConfigurationError("Disc type must be dvd or cd.")
+                  progress.name = name
                   progress.begin()
                   with tempfile.TemporaryDirectory(prefix="ps2chd-", dir=os.environ.get("RUNNER_TEMP")) as folder:
                       iso = Path(folder) / "source.iso"
@@ -405,15 +424,20 @@ jobs:
                           summary.write(f"\n```text\n{progress.timing_lines()}\nTotal elapsed: {duration(progress.elapsed())}\n```\n")
                       print("Upload complete. Download link is in the run summary.", flush=True)
                       notify_result(name, size, link, progress)
-              except Exception:
+              except Exception as error:
+                  detail = (str(error) if isinstance(error, ConfigurationError) else
+                            f"{stage} failed. Check source availability, disk space and VikingFile account/service status.")
                   if progress.ended is None:
-                      progress.finish(failed=True)
+                      progress.finish(failed=True, reason=detail)
                   # API bodies, redirect URLs and tracebacks can expose secrets.
-                  raise RuntimeError(f"{stage} failed. Check source availability, disk space and VikingFile account/service status.") from None
+                  raise WorkflowError(detail) from None
 
           if __name__ == "__main__":
               try:
                   main()
+              except WorkflowError as error:
+                  print(f"::error::{error}", flush=True)
+                  raise SystemExit(1)
               except Exception:
                   # Even URL parsing errors can contain the original secret value.
                   print("::error::Conversion/upload failed. Check both Actions secrets, filename, disc type, source availability, disk space and VikingFile status.", flush=True)

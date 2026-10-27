@@ -41,7 +41,7 @@ With neither service configured, the result is printed in the Actions log. Inval
 ## Run the workflow
 
 1. Open **Actions → ISO to CHD to VikingFile → Run workflow**.
-2. Set `filename`, for example `MyGame`. The `.chd` extension is added automatically. Use 1–100 ASCII letters, digits, dots, underscores, or hyphens, starting with a letter or digit. Do not include sensitive information.
+2. Set `filename`, for example `MyGame`. The `.chd` extension is added automatically. Use 1–160 letters (including Unicode), digits, spaces, dots, parentheses, brackets, apostrophes, ampersands, plus signs, commas, underscores, or hyphens, starting with a letter or digit. Leading and trailing whitespace is trimmed. Paths, slashes, control characters, and other punctuation are rejected. Do not include sensitive information.
 3. Select `dvd` for an original DVD, or `cd` for a CD ISO with 2048-byte sectors. Disc type is not inferred from file size.
 4. Start the workflow and wait for downloading, conversion, verification, and upload to finish.
 5. Open the run's **Summary** and follow **VikingFile download**.
