@@ -131,6 +131,28 @@ jobs:
                   return f"HTTP {int(error.code)}"
               return "connection, timeout or response error"
 
+          def byte_count(value):
+              # VikingFile returns decimal strings in live completion responses.
+              if type(value) is int and value >= 0:
+                  return value
+              if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+                  return int(value.strip())
+              return None
+
+          def human_size(value):
+              magnitude = abs(value)
+              unit, divisor = ("GiB", 1024**3) if magnitude >= 1024**3 else ("MiB", 1024**2)
+              return f"{value / divisor:,.2f} {unit} ({value:,} bytes)"
+
+          def savings(original, compressed):
+              if original is None or compressed is None or original <= 0:
+                  return None
+              saved = original - compressed
+              percent = abs(saved) / original * 100
+              if saved >= 0:
+                  return f"{human_size(saved)} · {percent:.2f}% saved"
+              return f"{human_size(-saved)} · {percent:.2f}% larger"
+
           def output_filename(value):
               name = value.strip()
               if (not name or not name[0].isalnum()
@@ -271,8 +293,10 @@ jobs:
               # Do not blindly retry completion: the first request may have succeeded.
               result = api_call("complete-upload", fields)
               link = https_url(result["url"], viking=True)
-              if result.get("size") != size or result.get("name") != path.name:
-                  raise ValueError("Completed upload does not match the CHD.")
+              if byte_count(result.get("size")) != size:
+                  raise WorkflowError("VikingFile completed the request, but its reported file size does not match the CHD. Check the file in your account before rerunning.")
+              if result.get("name") != path.name:
+                  raise WorkflowError("VikingFile completed the request, but its reported filename does not match the CHD. Check the file in your account before rerunning.")
               if stats is not None:
                   stats.finish()
               return link
@@ -314,6 +338,7 @@ jobs:
                   self.disc = None
                   self.disc_reason = None
                   self.link = None
+                  self.iso_size = None
                   self.size = None
                   self.failure_reason = None
                   self.sent = False
@@ -362,8 +387,13 @@ jobs:
                   fields.append({"name": "⏱ Total elapsed", "value": duration(self.elapsed()), "inline": True})
                   for stage, label in (("Downloading", "⬇ Download speed"), ("Uploading", "⬆ Upload speed")):
                       fields.append({"name": label, "value": self.transfers[stage].text(), "inline": True})
+                  if self.iso_size is not None:
+                      fields.append({"name": "💿 Original ISO size", "value": human_size(self.iso_size), "inline": True})
                   if self.size is not None:
-                      fields.append({"name": "📦 CHD size", "value": f"{self.size / 1024**2:,.2f} MiB", "inline": True})
+                      fields.append({"name": "📦 CHD size", "value": human_size(self.size), "inline": True})
+                  saved = savings(self.iso_size, self.size)
+                  if saved is not None:
+                      fields.append({"name": "💾 Space savings", "value": saved, "inline": True})
                   if self.link:
                       fields.append({"name": "🔗 Download", "value": f"[Download CHD from VikingFile]({self.link})", "inline": False})
                   if self.failure_reason:
@@ -446,7 +476,10 @@ jobs:
                       self.failed_stage = self.state
                       self.state = "Failed" if failed else "Completed"
                       self.ended = time.monotonic()
-                      self.size, self.link = size, link
+                      if size is not None:
+                          self.size = size
+                      if link is not None:
+                          self.link = link
                       self.failure_reason = reason
                   self.publish()
                   return self.sent
@@ -454,6 +487,9 @@ jobs:
           def notify_result(name, size, link, progress):
               message = (f"CHD conversion complete\nFile: {name}\nSize: {size:,} bytes\nDownload: {link}\n"
                          f"{progress.timing_lines()}\nTotal elapsed: {duration(progress.elapsed())}")
+              if progress.iso_size is not None:
+                  message += (f"\nOriginal ISO: {human_size(progress.iso_size)}\nCHD: {human_size(size)}"
+                              f"\nSpace savings: {savings(progress.iso_size, size)}")
               delivered = progress.sent
               fallback = bool(os.environ.get("DISCORD_WEBHOOK_URL", "").strip()) and not progress.sent
               token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -501,6 +537,8 @@ jobs:
                       print(stage, flush=True)
                       with progress.phase("Downloading"):
                           download(url, iso, stats=progress.transfers["Downloading"])
+                      with progress.lock:
+                          progress.iso_size = iso.stat().st_size
                       stage = "Detecting disc type"
                       with progress.lock:
                           progress.state = stage
@@ -511,6 +549,8 @@ jobs:
                       print(stage, flush=True)
                       with progress.phase("Compressing"):
                           subprocess.run(["chdman", "create" + disc, "-i", str(iso), "-o", str(chd)], check=True)
+                      with progress.lock:
+                          progress.size = chd.stat().st_size
                       stage = "Verifying CHD"
                       print(stage, flush=True)
                       with progress.phase("Verifying"):
@@ -526,6 +566,7 @@ jobs:
                           summary.write(f"## Conversion complete\n\nFile: `{name}`\n\n[VikingFile download]({link})\n")
                           summary.write(f"\n```text\n{progress.timing_lines()}\nTotal elapsed: {duration(progress.elapsed())}\n```\n")
                           summary.write(f"\nDisc type: {disc.upper()} ({reason})\n\nDownload: {progress.transfers['Downloading'].text()}\n\nUpload: {progress.transfers['Uploading'].text()}\n")
+                          summary.write(f"\nOriginal ISO: {human_size(progress.iso_size)}\n\nCHD: {human_size(size)}\n\nSpace savings: {savings(progress.iso_size, size)}\n")
                       print("Upload complete. Download link is in the run summary.", flush=True)
                       notify_result(name, size, link, progress)
               except Exception as error:
