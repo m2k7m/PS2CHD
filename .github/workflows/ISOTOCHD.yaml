@@ -18,8 +18,8 @@ on:
           - dvd
           - cd
       viking_folder:
-        description: Destination folder on VikingFile (supports Parent/Subfolder)
-        required: true
+        description: VikingFile folder (empty, root or ... uploads to account root)
+        required: false
         default: PS2
         type: string
 
@@ -173,7 +173,9 @@ jobs:
               return name + ".chd"
 
           def remote_folder(value):
-              folder = value.strip() or "PS2"
+              folder = value.strip()
+              if folder.lower() in ("", "root", "..."):
+                  return ""
               parts = folder.split("/")
               if (len(folder) > 255 or any(part.strip() in ("", ".", "..")
                       or not re.fullmatch(r"[\w .()\[\]'&+,-]+", part) for part in parts)):
@@ -295,7 +297,7 @@ jobs:
                           raise WorkflowError(f"Part upload failed after three attempts: {detail}.") from None
                       time.sleep(5 * (attempt + 1))
 
-          def upload(path, user, stats=None, folder="PS2"):
+          def upload(path, user, stats=None, folder=""):
               size = path.stat().st_size
               if stats is not None:
                   stats.begin(size)
@@ -308,7 +310,9 @@ jobs:
               if len(urls) != count or plan.get("numberParts") != count:
                   raise ValueError("Upload plan does not match file size.")
               fields = {"key": plan["key"], "uploadId": plan["uploadId"],
-                        "name": path.name, "user": user, "path": folder}
+                        "name": path.name, "user": user}
+              if folder:
+                  fields["path"] = folder
               for index, url in enumerate(urls):
                   print(f"Uploading part {index + 1}/{count}", flush=True)
                   offset = index * part_size
@@ -362,7 +366,7 @@ jobs:
                   self.transfers = {stage: TransferStats() for stage in ("Downloading", "Uploading")}
                   self.disc = None
                   self.disc_reason = None
-                  self.folder = "PS2"
+                  self.folder = ""
                   self.link = None
                   self.iso_size = None
                   self.size = None
@@ -397,8 +401,8 @@ jobs:
 
               def payload(self):
                   now = time.monotonic()
-                  fields = [{"name": "📀 Output", "value": f"`{self.name}`", "inline": False},
-                            {"name": "VikingFile folder", "value": f"`{self.folder}`", "inline": False}]
+                  display_name = f"{self.folder}/{self.name}" if self.folder else self.name
+                  fields = [{"name": "📀 Output", "value": f"`{display_name}`", "inline": False}]
                   if self.disc:
                       fields.append({"name": "Disc type", "value": f"{self.disc.upper()} · {self.disc_reason}", "inline": False})
                   for stage in self.STAGES:
@@ -516,7 +520,7 @@ jobs:
               if progress.iso_size is not None:
                   message += (f"\nOriginal ISO: {human_size(progress.iso_size)}\nCHD: {human_size(size)}"
                               f"\nSpace savings: {savings(progress.iso_size, size)}")
-              message += f"\nVikingFile folder: {progress.folder}"
+              message += f"\nVikingFile folder: {progress.folder or 'root'}"
               if progress.disc:
                   message += f"\nDisc type: {progress.disc.upper()} ({progress.disc_reason})"
               message += (f"\nDownload speed: {progress.transfers['Downloading'].text()}"
@@ -552,7 +556,7 @@ jobs:
                   except Exception:
                       raise ConfigurationError("ISO_URL must be a valid HTTPS URL without embedded credentials or a fragment.") from None
                   name = output_filename(os.environ.get("OUTPUT_NAME", "game"))
-                  folder = remote_folder(os.environ.get("VIKING_FOLDER", "PS2"))
+                  folder = remote_folder(os.environ.get("VIKING_FOLDER", ""))
                   disc = os.environ.get("DISC_TYPE", "auto")
                   if disc not in ("auto", "dvd", "cd"):
                       raise ConfigurationError("Disc type must be auto, dvd or cd.")
@@ -596,7 +600,7 @@ jobs:
                               summary.write(f"## Conversion complete\n\nFile: `{name}`\n\n[VikingFile download]({link})\n")
                               summary.write(f"\n```text\n{progress.timing_lines()}\nTotal elapsed: {duration(progress.elapsed())}\n```\n")
                               summary.write(f"\nDisc type: {disc.upper()} ({reason})\n\nDownload: {progress.transfers['Downloading'].text()}\n\nUpload: {progress.transfers['Uploading'].text()}\n")
-                              summary.write(f"\nOriginal ISO: {human_size(progress.iso_size)}\n\nCHD: {human_size(size)}\n\nSpace savings: {savings(progress.iso_size, size)}\n\nVikingFile folder: `{folder}`\n")
+                              summary.write(f"\nOriginal ISO: {human_size(progress.iso_size)}\n\nCHD: {human_size(size)}\n\nSpace savings: {savings(progress.iso_size, size)}\n\nVikingFile folder: `{folder or 'root'}`\n")
                       print("Upload complete.", flush=True)
                       notify_result(name, size, link, progress)
               except Exception as error:
