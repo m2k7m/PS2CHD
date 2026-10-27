@@ -9,11 +9,12 @@ on:
         default: game
         type: string
       disc_type:
-        description: Original disc type
+        description: Disc detection (auto, or manual override)
         required: true
-        default: dvd
+        default: auto
         type: choice
         options:
+          - auto
           - dvd
           - cd
 
@@ -56,6 +57,7 @@ jobs:
           import threading
           import time
           import urllib.parse
+          import urllib.error
           import urllib.request
 
           API = "https://vikingfile.com/api/"
@@ -68,6 +70,66 @@ jobs:
 
           class ConfigurationError(WorkflowError):
               pass
+
+          def detect_disc(path, requested="auto"):
+              if requested in ("dvd", "cd"):
+                  return requested, "Manual override"
+              if requested != "auto":
+                  raise ConfigurationError("Disc type must be auto, dvd or cd.")
+              # Standard 2048-byte ISO images omit physical media information.
+              # Use positive filesystem markers before considering size.
+              with path.open("rb") as source:
+                  source.seek(16 * 2048)
+                  descriptors = source.read(240 * 2048)
+              udf = any(descriptors[offset + 1:offset + 6] in (b"NSR02", b"NSR03")
+                        for offset in range(0, len(descriptors), 2048))
+              xa = descriptors[1024:1032] == b"CD-XA001"
+              if udf and xa:
+                  raise ConfigurationError("Conflicting disc markers. Select dvd or cd manually after checking the original disc.")
+              if udf:
+                  return "dvd", "UDF volume recognition marker"
+              if xa:
+                  return "cd", "CD-ROM XA marker"
+              if path.stat().st_size > 1024**3:
+                  return "dvd", "Image exceeds 1 GiB, beyond an original PS2 CD capacity"
+              raise ConfigurationError("Disc type is ambiguous: this small ISO has no UDF or CD-XA marker. Run again with disc_type set to dvd or cd for the original disc.")
+
+          class TransferStats:
+              def __init__(self):
+                  self.lock = threading.Lock()
+                  self.started = None
+                  self.ended = None
+                  self.bytes = 0
+                  self.total = None
+
+              def begin(self, total=None):
+                  with self.lock:
+                      self.started = time.monotonic()
+                      self.ended = None
+                      self.bytes = 0
+                      self.total = total
+
+              def record(self, count):
+                  with self.lock:
+                      self.bytes += count
+
+              def finish(self):
+                  with self.lock:
+                      if self.started is not None and self.ended is None:
+                          self.ended = time.monotonic()
+
+              def text(self):
+                  with self.lock:
+                      if self.started is None:
+                          return "— Pending"
+                      elapsed = (self.ended if self.ended is not None else time.monotonic()) - self.started
+                      rate = self.bytes / max(elapsed, 0.001) / 1024**2
+                      return f"{rate:,.2f} MiB/s average\n{self.bytes / 1024**2:,.2f} MiB transferred"
+
+          def network_detail(error):
+              if isinstance(error, urllib.error.HTTPError):
+                  return f"HTTP {int(error.code)}"
+              return "connection, timeout or response error"
 
           def output_filename(value):
               name = value.strip()
@@ -103,9 +165,11 @@ jobs:
                   raise ValueError("VikingFile rejected the API request.")
               return result
 
-          def download(url, target):
+          def download(url, target, stats=None):
               # Redirects may contain signed tokens: never print URLs or exceptions.
               request = urllib.request.Request(url, headers={"User-Agent": "PS2CHD/1.0"})
+              if stats is not None:
+                  stats.begin()
               with OPENER.open(request, timeout=120) as response, target.open("wb") as output:
                   expected = response.headers.get("Content-Length")
                   expected = int(expected) if expected is not None else None
@@ -125,6 +189,8 @@ jobs:
                       if shutil.disk_usage(target.parent).free < total + len(block) + RESERVE:
                           raise ValueError("Insufficient disk space.")
                       output.write(block)
+                      if stats is not None:
+                          stats.record(len(block))
               if total == 0 or (expected is not None and total != expected):
                   raise ValueError("Empty or incomplete download.")
               # ISO9660 volume descriptor, also present on standard PS2 DVD ISOs.
@@ -135,8 +201,10 @@ jobs:
               if total % 2048:
                   raise ValueError("ISO must contain complete 2048-byte sectors.")
               print(f"ISO downloaded: {total:,} bytes", flush=True)
+              if stats is not None:
+                  stats.finish()
 
-          def file_blocks(source, length):
+          def file_blocks(source, length, stats=None):
               remaining = length
               while remaining:
                   block = source.read(min(BLOCK, remaining))
@@ -144,9 +212,16 @@ jobs:
                       raise ValueError("Unexpected end of CHD file.")
                   remaining -= len(block)
                   yield block
+                  if stats is not None:
+                      stats.record(len(block))
 
-          def upload_part(path, url, offset, length):
-              https_url(url, viking=True)
+          def upload_part(path, url, offset, length, stats=None):
+              # Signed storage URLs come from VikingFile's HTTPS API and may use
+              # external S3 providers (currently OVH), not a vikingfile.com host.
+              try:
+                  https_url(url)
+              except Exception:
+                  raise WorkflowError("VikingFile returned an invalid HTTPS storage URL.") from None
               # Do not redirect a PUT containing file data to another destination.
               class NoRedirect(urllib.request.HTTPRedirectHandler):
                   def redirect_request(self, *args, **kwargs):
@@ -157,21 +232,26 @@ jobs:
                       with path.open("rb") as source:
                           source.seek(offset)
                           request = urllib.request.Request(
-                              url, data=file_blocks(source, length), method="PUT",
+                              url, data=file_blocks(source, length, stats), method="PUT",
                               headers={"Content-Length": str(length),
                                        "Content-Type": "application/octet-stream"})
                           with opener.open(request, timeout=300) as response:
                               etag = response.headers.get("ETag")
                               if not etag:
-                                  raise ValueError("Upload response has no ETag.")
+                                  raise WorkflowError("Storage upload response has no ETag.")
                               return etag
-                  except Exception:
+                  except Exception as error:
+                      if isinstance(error, urllib.error.HTTPError):
+                          error.close()
                       if attempt == 2:
-                          raise RuntimeError("Part upload failed after three attempts.") from None
+                          detail = str(error) if isinstance(error, WorkflowError) else network_detail(error)
+                          raise WorkflowError(f"Part upload failed after three attempts: {detail}.") from None
                       time.sleep(5 * (attempt + 1))
 
-          def upload(path, user):
+          def upload(path, user, stats=None):
               size = path.stat().st_size
+              if stats is not None:
+                  stats.begin(size)
               plan = api_call("get-upload-url", {"size": size})
               part_size = plan.get("partSize")
               urls = plan.get("urls")
@@ -185,7 +265,7 @@ jobs:
               for index, url in enumerate(urls):
                   print(f"Uploading part {index + 1}/{count}", flush=True)
                   offset = index * part_size
-                  etag = upload_part(path, url, offset, min(part_size, size - offset))
+                  etag = upload_part(path, url, offset, min(part_size, size - offset), stats=stats)
                   fields[f"parts[{index}][PartNumber]"] = index + 1
                   fields[f"parts[{index}][ETag]"] = etag
               # Do not blindly retry completion: the first request may have succeeded.
@@ -193,6 +273,8 @@ jobs:
               link = https_url(result["url"], viking=True)
               if result.get("size") != size or result.get("name") != path.name:
                   raise ValueError("Completed upload does not match the CHD.")
+              if stats is not None:
+                  stats.finish()
               return link
 
           def notification_request(url, payload, headers=None, method="POST"):
@@ -228,6 +310,9 @@ jobs:
                   self.active = None
                   self.active_since = None
                   self.timings = {}
+                  self.transfers = {stage: TransferStats() for stage in ("Downloading", "Uploading")}
+                  self.disc = None
+                  self.disc_reason = None
                   self.link = None
                   self.size = None
                   self.failure_reason = None
@@ -263,6 +348,8 @@ jobs:
                   now = time.monotonic()
                   fields = [{"name": "📀 Output", "value": f"`{self.name}`", "inline": False},
                             {"name": "🔒 Source", "value": "Task for the configured ISO link (hidden)", "inline": False}]
+                  if self.disc:
+                      fields.append({"name": "Disc type", "value": f"{self.disc.upper()} · {self.disc_reason}", "inline": False})
                   for stage in self.STAGES:
                       if stage == self.active:
                           value = f"⏳ {duration(now - self.active_since)} · in progress"
@@ -273,6 +360,8 @@ jobs:
                           value = "— Pending"
                       fields.append({"name": stage, "value": value, "inline": True})
                   fields.append({"name": "⏱ Total elapsed", "value": duration(self.elapsed()), "inline": True})
+                  for stage, label in (("Downloading", "⬇ Download speed"), ("Uploading", "⬆ Upload speed")):
+                      fields.append({"name": label, "value": self.transfers[stage].text(), "inline": True})
                   if self.size is not None:
                       fields.append({"name": "📦 CHD size", "value": f"{self.size / 1024**2:,.2f} MiB", "inline": True})
                   if self.link:
@@ -307,7 +396,9 @@ jobs:
                               raise ValueError("Discord returned a different message.")
                           self.message_id = str(result["id"])
                           self.sent = True
-                      except Exception:
+                      except Exception as error:
+                          if isinstance(error, urllib.error.HTTPError):
+                              error.close()
                           self.sent = False
                           self.warning()
                           if creating:
@@ -342,9 +433,13 @@ jobs:
                       with self.lock:
                           self.timings[stage] = time.monotonic() - self.active_since
                           self.active = None
+                      if stage in self.transfers:
+                          self.transfers[stage].finish()
 
               def finish(self, failed=False, size=None, link=None, reason=None):
                   self.stop.set()
+                  for transfer in self.transfers.values():
+                      transfer.finish()
                   if self.worker:
                       self.worker.join()
                   with self.lock:
@@ -373,7 +468,9 @@ jobs:
                           raise ValueError("Telegram rejected the notification.")
                       delivered = True
                       print("Telegram notification sent.", flush=True)
-                  except Exception:
+                  except Exception as error:
+                      if isinstance(error, urllib.error.HTTPError):
+                          error.close()
                       print("::warning::Telegram notification failed. Check both Telegram secrets and start the bot's private chat.", flush=True)
                       fallback = True
               if not delivered or fallback:
@@ -392,9 +489,9 @@ jobs:
                   except Exception:
                       raise ConfigurationError("ISO_URL must be a valid HTTPS URL without embedded credentials or a fragment.") from None
                   name = output_filename(os.environ.get("OUTPUT_NAME", "game"))
-                  disc = os.environ.get("DISC_TYPE", "dvd")
-                  if disc not in ("dvd", "cd"):
-                      raise ConfigurationError("Disc type must be dvd or cd.")
+                  disc = os.environ.get("DISC_TYPE", "auto")
+                  if disc not in ("auto", "dvd", "cd"):
+                      raise ConfigurationError("Disc type must be auto, dvd or cd.")
                   progress.name = name
                   progress.begin()
                   with tempfile.TemporaryDirectory(prefix="ps2chd-", dir=os.environ.get("RUNNER_TEMP")) as folder:
@@ -403,7 +500,13 @@ jobs:
                       stage = "Downloading ISO"
                       print(stage, flush=True)
                       with progress.phase("Downloading"):
-                          download(url, iso)
+                          download(url, iso, stats=progress.transfers["Downloading"])
+                      stage = "Detecting disc type"
+                      with progress.lock:
+                          progress.state = stage
+                      disc, reason = detect_disc(iso, disc)
+                      progress.disc, progress.disc_reason = disc, reason
+                      print(f"Disc type: {disc.upper()} ({reason})", flush=True)
                       stage = "Converting ISO"
                       print(stage, flush=True)
                       with progress.phase("Compressing"):
@@ -416,17 +519,21 @@ jobs:
                       stage = "Uploading CHD"
                       print(stage, flush=True)
                       with progress.phase("Uploading"):
-                          link = upload(chd, user)
+                          link = upload(chd, user, stats=progress.transfers["Uploading"])
                       size = chd.stat().st_size
                       progress.finish(size=size, link=link)
                       with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
                           summary.write(f"## Conversion complete\n\nFile: `{name}`\n\n[VikingFile download]({link})\n")
                           summary.write(f"\n```text\n{progress.timing_lines()}\nTotal elapsed: {duration(progress.elapsed())}\n```\n")
+                          summary.write(f"\nDisc type: {disc.upper()} ({reason})\n\nDownload: {progress.transfers['Downloading'].text()}\n\nUpload: {progress.transfers['Uploading'].text()}\n")
                       print("Upload complete. Download link is in the run summary.", flush=True)
                       notify_result(name, size, link, progress)
               except Exception as error:
-                  detail = (str(error) if isinstance(error, ConfigurationError) else
+                  detail = (str(error) if isinstance(error, WorkflowError) else
+                            f"{stage} failed: {network_detail(error)}." if isinstance(error, urllib.error.URLError) else
                             f"{stage} failed. Check source availability, disk space and VikingFile account/service status.")
+                  if isinstance(error, urllib.error.HTTPError):
+                      error.close()
                   if progress.ended is None:
                       progress.finish(failed=True, reason=detail)
                   # API bodies, redirect URLs and tracebacks can expose secrets.
