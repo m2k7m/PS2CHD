@@ -1,0 +1,421 @@
+name: ISO to CHD to VikingFile
+
+on:
+  workflow_dispatch:
+    inputs:
+      filename:
+        description: Output filename (without .chd; no sensitive information)
+        required: true
+        default: game
+        type: string
+      disc_type:
+        description: Original disc type
+        required: true
+        default: dvd
+        type: choice
+        options:
+          - dvd
+          - cd
+
+permissions: {}
+
+jobs:
+  convert:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install chdman
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mame-tools
+
+      - name: Download, convert, verify and upload
+        env:
+          ISO_URL: ${{ secrets.ISO_URL }}
+          VIKINGFILE_USER_HASH: ${{ secrets.VIKINGFILE_USER_HASH }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          OUTPUT_NAME: ${{ inputs.filename }}
+          DISC_TYPE: ${{ inputs.disc_type }}
+        run: |
+          python3 - <<'PY'
+          import json
+          from contextlib import contextmanager
+          from datetime import datetime, timezone
+          import math
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+          import tempfile
+          import threading
+          import time
+          import urllib.parse
+          import urllib.request
+
+          API = "https://vikingfile.com/api/"
+          BLOCK = 1024 * 1024
+          MAX_ISO = 9 * 1024**3
+          RESERVE = 1024**3
+
+          def https_url(value, viking=False):
+              parsed = urllib.parse.urlsplit(value)
+              host = (parsed.hostname or "").lower()
+              if (parsed.scheme != "https" or not host or parsed.username
+                      or parsed.password or parsed.fragment):
+                  raise ValueError("An HTTPS URL without credentials or fragments is required.")
+              if viking and not (host == "vikingfile.com" or host.endswith(".vikingfile.com")):
+                  raise ValueError("Unexpected VikingFile hostname.")
+              return value
+
+          class HTTPSRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  https_url(newurl)
+                  return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+          OPENER = urllib.request.build_opener(HTTPSRedirect())
+
+          def api_call(endpoint, fields):
+              data = urllib.parse.urlencode(fields).encode()
+              request = urllib.request.Request(API + endpoint, data=data)
+              with OPENER.open(request, timeout=120) as response:
+                  result = json.loads(response.read(2 * BLOCK))
+              if not isinstance(result, dict) or result.get("error"):
+                  raise ValueError("VikingFile rejected the API request.")
+              return result
+
+          def download(url, target):
+              # Redirects may contain signed tokens: never print URLs or exceptions.
+              request = urllib.request.Request(url, headers={"User-Agent": "PS2CHD/1.0"})
+              with OPENER.open(request, timeout=120) as response, target.open("wb") as output:
+                  expected = response.headers.get("Content-Length")
+                  expected = int(expected) if expected is not None else None
+                  if expected is not None and (expected <= 0 or expected > MAX_ISO):
+                      raise ValueError("ISO size exceeds the supported limit.")
+                  if expected and shutil.disk_usage(target.parent).free < 2 * expected + RESERVE:
+                      raise ValueError("Insufficient space for ISO and CHD.")
+                  total = 0
+                  while True:
+                      block = response.read(BLOCK)
+                      if not block:
+                          break
+                      total += len(block)
+                      if total > MAX_ISO:
+                          raise ValueError("ISO size exceeds the supported limit.")
+                      # Leave space for a potentially incompressible CHD as well.
+                      if shutil.disk_usage(target.parent).free < total + len(block) + RESERVE:
+                          raise ValueError("Insufficient disk space.")
+                      output.write(block)
+              if total == 0 or (expected is not None and total != expected):
+                  raise ValueError("Empty or incomplete download.")
+              # ISO9660 volume descriptor, also present on standard PS2 DVD ISOs.
+              with target.open("rb") as source:
+                  source.seek(16 * 2048 + 1)
+                  if source.read(5) != b"CD001":
+                      raise ValueError("Expected a raw ISO9660 ISO, not HTML or an archive.")
+              if total % 2048:
+                  raise ValueError("ISO must contain complete 2048-byte sectors.")
+              print(f"ISO downloaded: {total:,} bytes", flush=True)
+
+          def file_blocks(source, length):
+              remaining = length
+              while remaining:
+                  block = source.read(min(BLOCK, remaining))
+                  if not block:
+                      raise ValueError("Unexpected end of CHD file.")
+                  remaining -= len(block)
+                  yield block
+
+          def upload_part(path, url, offset, length):
+              https_url(url, viking=True)
+              # Do not redirect a PUT containing file data to another destination.
+              class NoRedirect(urllib.request.HTTPRedirectHandler):
+                  def redirect_request(self, *args, **kwargs):
+                      return None
+              opener = urllib.request.build_opener(NoRedirect())
+              for attempt in range(3):
+                  try:
+                      with path.open("rb") as source:
+                          source.seek(offset)
+                          request = urllib.request.Request(
+                              url, data=file_blocks(source, length), method="PUT",
+                              headers={"Content-Length": str(length),
+                                       "Content-Type": "application/octet-stream"})
+                          with opener.open(request, timeout=300) as response:
+                              etag = response.headers.get("ETag")
+                              if not etag:
+                                  raise ValueError("Upload response has no ETag.")
+                              return etag
+                  except Exception:
+                      if attempt == 2:
+                          raise RuntimeError("Part upload failed after three attempts.") from None
+                      time.sleep(5 * (attempt + 1))
+
+          def upload(path, user):
+              size = path.stat().st_size
+              plan = api_call("get-upload-url", {"size": size})
+              part_size = plan.get("partSize")
+              urls = plan.get("urls")
+              if not isinstance(part_size, int) or part_size <= 0 or not isinstance(urls, list):
+                  raise ValueError("Invalid upload plan.")
+              count = math.ceil(size / part_size)
+              if len(urls) != count or plan.get("numberParts") != count:
+                  raise ValueError("Upload plan does not match file size.")
+              fields = {"key": plan["key"], "uploadId": plan["uploadId"],
+                        "name": path.name, "user": user}
+              for index, url in enumerate(urls):
+                  print(f"Uploading part {index + 1}/{count}", flush=True)
+                  offset = index * part_size
+                  etag = upload_part(path, url, offset, min(part_size, size - offset))
+                  fields[f"parts[{index}][PartNumber]"] = index + 1
+                  fields[f"parts[{index}][ETag]"] = etag
+              # Do not blindly retry completion: the first request may have succeeded.
+              result = api_call("complete-upload", fields)
+              link = https_url(result["url"], viking=True)
+              if result.get("size") != size or result.get("name") != path.name:
+                  raise ValueError("Completed upload does not match the CHD.")
+              return link
+
+          def notification_request(url, payload, headers=None, method="POST"):
+              class NoRedirect(urllib.request.HTTPRedirectHandler):
+                  def redirect_request(self, *args, **kwargs):
+                      return None
+              # Never forward bot credentials through redirects.
+              opener = urllib.request.build_opener(NoRedirect())
+              request = urllib.request.Request(
+                  url, data=json.dumps(payload).encode(), method=method,
+                  headers={"Content-Type": "application/json",
+                           "User-Agent": "DiscordBot (https://github.com, 1.0)",
+                           **(headers or {})})
+              with opener.open(request, timeout=30) as response:
+                  return json.loads(response.read(BLOCK))
+
+          def duration(seconds):
+              seconds = max(0, int(seconds))
+              hours, seconds = divmod(seconds, 3600)
+              minutes, seconds = divmod(seconds, 60)
+              return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+          class DiscordProgress:
+              STAGES = ("Downloading", "Compressing", "Verifying", "Uploading")
+
+              def __init__(self, name):
+                  self.name = name
+                  self.webhook = ""
+                  self.message_id = None
+                  self.state = "Task started"
+                  self.started = time.monotonic()
+                  self.ended = None
+                  self.active = None
+                  self.active_since = None
+                  self.timings = {}
+                  self.link = None
+                  self.size = None
+                  self.sent = False
+                  self.warned = False
+                  self.lock = threading.RLock()
+                  self.stop = threading.Event()
+                  self.worker = None
+                  raw = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+                  if raw:
+                      try:
+                          parsed = urllib.parse.urlsplit(https_url(raw))
+                          if (parsed.netloc not in ("discord.com", "canary.discord.com", "ptb.discord.com")
+                                  or not re.fullmatch(r"/api(?:/v[0-9]+)?/webhooks/[0-9]+/[A-Za-z0-9._-]+/?", parsed.path)
+                                  or parsed.query):
+                              raise ValueError("Invalid webhook URL.")
+                          self.webhook = raw.rstrip("/")
+                      except Exception:
+                          self.warning()
+
+              def warning(self):
+                  if not self.warned:
+                      print("::warning::Discord progress update failed. Check DISCORD_WEBHOOK_URL and webhook permissions. Results remain available in Actions.", flush=True)
+                      self.warned = True
+
+              def elapsed(self):
+                  return (self.ended if self.ended is not None else time.monotonic()) - self.started
+
+              def timing_lines(self):
+                  return "\n".join(f"{stage}: {duration(value)}" for stage, value in self.timings.items())
+
+              def payload(self):
+                  now = time.monotonic()
+                  fields = [{"name": "📀 Output", "value": f"`{self.name}`", "inline": False},
+                            {"name": "🔒 Source", "value": "Task for the configured ISO link (hidden)", "inline": False}]
+                  for stage in self.STAGES:
+                      if stage == self.active:
+                          value = f"⏳ {duration(now - self.active_since)} · in progress"
+                      elif stage in self.timings:
+                          icon = "❌" if self.state == "Failed" and stage == self.failed_stage else "✅"
+                          value = f"{icon} {duration(self.timings[stage])}"
+                      else:
+                          value = "— Pending"
+                      fields.append({"name": stage, "value": value, "inline": True})
+                  fields.append({"name": "⏱ Total elapsed", "value": duration(self.elapsed()), "inline": True})
+                  if self.size is not None:
+                      fields.append({"name": "📦 CHD size", "value": f"{self.size / 1024**2:,.2f} MiB", "inline": True})
+                  if self.link:
+                      fields.append({"name": "🔗 Download", "value": f"[Download CHD from VikingFile]({self.link})", "inline": False})
+                  description = {"Task started": "Task started for your configured ISO link.",
+                                 "Completed": "Your CHD is verified and ready to download.",
+                                 "Failed": "Processing stopped. Check the Actions log for details."}.get(
+                                     self.state, f"{self.state} your game. This message refreshes every 30 seconds.")
+                  embed = {"title": f"{'✅' if self.state == 'Completed' else '❌' if self.state == 'Failed' else '⚙️'} PS2CHD • {self.state}",
+                           "description": description, "color": 0x2ECC71 if self.state == "Completed" else 0xE74C3C if self.state == "Failed" else 0x5865F2,
+                           "fields": fields, "timestamp": datetime.now(timezone.utc).isoformat(),
+                           "footer": {"text": "PS2CHD • ISO → CHD → VikingFile | Times: HH:MM:SS"}}
+                  repository = os.environ.get("GITHUB_REPOSITORY", "")
+                  run_id = os.environ.get("GITHUB_RUN_ID", "")
+                  if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) and run_id.isdigit():
+                      embed["url"] = f"https://github.com/{repository}/actions/runs/{run_id}"
+                  return {"embeds": [embed], "allowed_mentions": {"parse": []}}
+
+              def publish(self):
+                  with self.lock:
+                      if not self.webhook:
+                          return
+                      creating = self.message_id is None
+                      try:
+                          url = self.webhook + ("?wait=true" if creating else f"/messages/{self.message_id}")
+                          result = notification_request(url, self.payload(), method="POST" if creating else "PATCH")
+                          if not isinstance(result, dict) or not re.fullmatch(r"[0-9]+", str(result.get("id", ""))):
+                              raise ValueError("Discord did not confirm the message.")
+                          if not creating and str(result["id"]) != self.message_id:
+                              raise ValueError("Discord returned a different message.")
+                          self.message_id = str(result["id"])
+                          self.sent = True
+                      except Exception:
+                          self.sent = False
+                          self.warning()
+                          if creating:
+                              # An uncertain POST may already have created a message.
+                              # Do not create duplicates by automatically retrying it.
+                              self.webhook = ""
+
+              def heartbeat(self):
+                  while not self.stop.wait(30):
+                      self.publish()
+
+              def begin(self):
+                  self.publish()
+                  if self.message_id:
+                      self.worker = threading.Thread(target=self.heartbeat, daemon=True)
+                      self.worker.start()
+
+              @contextmanager
+              def phase(self, stage):
+                  with self.lock:
+                      self.state = stage
+                      self.active = stage
+                      self.active_since = time.monotonic()
+                  self.publish()
+                  # Time the operation itself, excluding the stage-change request.
+                  with self.lock:
+                      self.active = stage
+                      self.active_since = time.monotonic()
+                  try:
+                      yield
+                  finally:
+                      with self.lock:
+                          self.timings[stage] = time.monotonic() - self.active_since
+                          self.active = None
+
+              def finish(self, failed=False, size=None, link=None):
+                  self.stop.set()
+                  if self.worker:
+                      self.worker.join()
+                  with self.lock:
+                      self.failed_stage = self.state
+                      self.state = "Failed" if failed else "Completed"
+                      self.ended = time.monotonic()
+                      self.size, self.link = size, link
+                  self.publish()
+                  return self.sent
+
+          def notify_result(name, size, link, progress):
+              message = (f"CHD conversion complete\nFile: {name}\nSize: {size:,} bytes\nDownload: {link}\n"
+                         f"{progress.timing_lines()}\nTotal elapsed: {duration(progress.elapsed())}")
+              delivered = progress.sent
+              fallback = bool(os.environ.get("DISCORD_WEBHOOK_URL", "").strip()) and not progress.sent
+              token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+              target = os.environ.get("TELEGRAM_USER_ID", "").strip()
+              if token or target:
+                  try:
+                      if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token) or not re.fullmatch(r"[0-9]+", target):
+                          raise ValueError("Set both Telegram secrets correctly.")
+                      result = notification_request(f"https://api.telegram.org/bot{token}/sendMessage",
+                                                    {"chat_id": target, "text": message})
+                      if not isinstance(result, dict) or result.get("ok") is not True:
+                          raise ValueError("Telegram rejected the notification.")
+                      delivered = True
+                      print("Telegram notification sent.", flush=True)
+                  except Exception:
+                      print("::warning::Telegram notification failed. Check both Telegram secrets and start the bot's private chat.", flush=True)
+                      fallback = True
+              if not delivered or fallback:
+                  print(message, flush=True)
+
+          def main():
+              url = os.environ.get("ISO_URL", "").strip()
+              user = os.environ.get("VIKINGFILE_USER_HASH", "").strip()
+              if not url or not user:
+                  raise ValueError("Add ISO_URL and VIKINGFILE_USER_HASH as Actions secrets.")
+              https_url(url)
+              name = os.environ.get("OUTPUT_NAME", "game")
+              if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", name):
+                  raise ValueError("Filename must be 1-100 ASCII letters, digits, dots, underscores or hyphens.")
+              disc = os.environ.get("DISC_TYPE", "dvd")
+              if disc not in ("dvd", "cd"):
+                  raise ValueError("Disc type must be dvd or cd.")
+              name = name if name.lower().endswith(".chd") else name + ".chd"
+              stage = "Preparing"
+              progress = DiscordProgress(name)
+              try:
+                  progress.begin()
+                  with tempfile.TemporaryDirectory(prefix="ps2chd-", dir=os.environ.get("RUNNER_TEMP")) as folder:
+                      iso = Path(folder) / "source.iso"
+                      chd = Path(folder) / name
+                      stage = "Downloading ISO"
+                      print(stage, flush=True)
+                      with progress.phase("Downloading"):
+                          download(url, iso)
+                      stage = "Converting ISO"
+                      print(stage, flush=True)
+                      with progress.phase("Compressing"):
+                          subprocess.run(["chdman", "create" + disc, "-i", str(iso), "-o", str(chd)], check=True)
+                      stage = "Verifying CHD"
+                      print(stage, flush=True)
+                      with progress.phase("Verifying"):
+                          subprocess.run(["chdman", "verify", "-i", str(chd)], check=True)
+                      iso.unlink()
+                      stage = "Uploading CHD"
+                      print(stage, flush=True)
+                      with progress.phase("Uploading"):
+                          link = upload(chd, user)
+                      size = chd.stat().st_size
+                      progress.finish(size=size, link=link)
+                      with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                          summary.write(f"## Conversion complete\n\nFile: `{name}`\n\n[VikingFile download]({link})\n")
+                          summary.write(f"\n```text\n{progress.timing_lines()}\nTotal elapsed: {duration(progress.elapsed())}\n```\n")
+                      print("Upload complete. Download link is in the run summary.", flush=True)
+                      notify_result(name, size, link, progress)
+              except Exception:
+                  if progress.ended is None:
+                      progress.finish(failed=True)
+                  # API bodies, redirect URLs and tracebacks can expose secrets.
+                  raise RuntimeError(f"{stage} failed. Check source availability, disk space and VikingFile account/service status.") from None
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  # Even URL parsing errors can contain the original secret value.
+                  print("::error::Conversion/upload failed. Check both Actions secrets, filename, disc type, source availability, disk space and VikingFile status.", flush=True)
+                  raise SystemExit(1)
+          PY
